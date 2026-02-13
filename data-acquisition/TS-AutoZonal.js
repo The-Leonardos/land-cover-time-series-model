@@ -8,7 +8,7 @@
 // CONFIG
 // ----------------------
 var START_YEAR = 2016;
-var SCALE = 10;
+var SCALE = 10;cd
 var MAX_PIXELS_PER_REGION = 1e13;
 
 // Hole-fill lookback:
@@ -139,6 +139,70 @@ function quarterlyFilledLabelImage(w) {
 }
 
 // ----------------------
+// FILL LAG STATISTICS (per quarter)
+// ----------------------
+function quarterlyFillLagStats(w) {
+  var start = ee.Date(w.get("start"));
+  var end   = ee.Date(w.get("end"));
+
+  var quarterIC = dw.filterDate(start, end);
+
+  // Quarterly MODE
+  var qMode = quarterIC.mode().clip(boundaryGeom);
+
+  // Fill window start
+  var fillStart = ee.Algorithms.If(
+      LOOKBACK_MONTHS === null,
+      ee.Date.fromYMD(START_YEAR, 1, 1),
+      start.advance(ee.Number(LOOKBACK_MONTHS).multiply(-1), 'month')
+  );
+  fillStart = ee.Date(fillStart);
+
+  // Build history with timestamp band
+  var history = dw.filterDate(fillStart, end);
+
+  var withTime = history.map(function(img) {
+    var t = ee.Image.constant(img.date().millis())
+        .rename('t')
+        .toInt64();
+    return img.addBands(t);
+  });
+
+  // Most recent valid label + timestamp
+  var recent = withTime.qualityMosaic('t');
+  var recentTime = recent.select('t');
+
+  // Mask where quarterly mode is missing
+  var missingMask = qMode.mask().not();
+
+  // Current quarter end timestamp
+  var currentTime = ee.Image.constant(end.millis()).toInt64();
+
+  // Lag in days (only for filled pixels)
+  var lagDays = currentTime.subtract(recentTime)
+      .divide(1000 * 60 * 60 * 24)
+      .updateMask(missingMask);
+
+  // Reduce over boundary
+  var stats = lagDays.reduceRegion({
+    reducer: ee.Reducer.mean()
+        .combine({reducer2: ee.Reducer.min(), sharedInputs: true})
+        .combine({reducer2: ee.Reducer.max(), sharedInputs: true}),
+    geometry: boundaryGeom,
+    scale: SCALE,
+    maxPixels: MAX_PIXELS_PER_REGION
+  });
+
+  return ee.Feature(null, {
+    year: w.get("year"),
+    quarter: w.get("quarter"),
+    mean_lag_days: stats.get("constant_mean"),
+    min_lag_days: stats.get("constant_min"),
+    max_lag_days: stats.get("constant_max")
+  });
+}
+
+// ----------------------
 // ZONAL STATS (GROUP REDUCER) on FILLED label image
 // ----------------------
 function zonalPctFlatForQuarter(labelImg) {
@@ -248,6 +312,23 @@ windows.evaluate(function(winList) {
 
     // ---- IMPORTANT: this is the FILLED image ----
     var filledLabelImg = quarterlyFilledLabelImage(w);
+
+    // ----------------------
+    // FILL LAG EXPORT
+    // ----------------------
+    var lagFeature = quarterlyFillLagStats(w);
+
+    var lagDesc = "DW_Fill_Lag_Stats_" + year + "_Q" + q;
+
+    Export.table.toDrive({
+      collection: ee.FeatureCollection([lagFeature]),
+      description: lagDesc,
+      folder: DRIVE_FOLDER,
+      fileNamePrefix: lagDesc,
+      fileFormat: EXPORT_FORMAT
+    });
+
+    print("Created lag export task:", lagDesc);
 
     // Zonal stats on FILLED image
     var out = zonalPctFlatForQuarter(filledLabelImg);
