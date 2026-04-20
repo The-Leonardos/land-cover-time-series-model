@@ -8,7 +8,7 @@
 // CONFIG
 // ----------------------
 var START_YEAR = 2016;
-var SCALE = 10;cd
+var SCALE = 10;
 var MAX_PIXELS_PER_REGION = 1e13;
 
 // Hole-fill lookback:
