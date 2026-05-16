@@ -18,22 +18,22 @@ var LOOKBACK_MONTHS = 24;
 
 // Assets
 var BARANGAYS_ASSET = "projects/thesis-478211/assets/BC_Barangays";
-var BOUNDARY_ASSET  = "projects/thesis-478211/assets/BC_Boundary";
+var BOUNDARY_ASSET = "projects/thesis-478211/assets/BC_Boundary";
 
 // Export
-var DRIVE_FOLDER  = "GEE_DW_Filled_ClassPct_Flat";
+var DRIVE_FOLDER = "GEE_DW_Filled_ClassPct_Flat";
 var EXPORT_FORMAT = "CSV"; // or "JSON"
 
 // ----------------------
 // DATA
 // ----------------------
-var barangays   = ee.FeatureCollection(BARANGAYS_ASSET);
-var boundaryFc  = ee.FeatureCollection(BOUNDARY_ASSET);
+var barangays = ee.FeatureCollection(BARANGAYS_ASSET);
+var boundaryFc = ee.FeatureCollection(BOUNDARY_ASSET);
 var boundaryGeom = boundaryFc.geometry();
 
 // Map display (optional)
 Map.centerObject(boundaryFc, 10);
-Map.addLayer(boundaryFc.style({color: 'red', fillColor: '00000000', width: 2}), {}, 'Boundary');
+Map.addLayer(boundaryFc.style({ color: 'red', fillColor: '00000000', width: 2 }), {}, 'Boundary');
 
 // Dynamic World labels
 var dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
@@ -78,9 +78,9 @@ function buildQuarterWindows(startYear) {
   var cutoff = latestCompletedQuarterStart(); // quarters must end <= cutoff
   var endYear = ee.Number.parse(cutoff.advance(-1, "day").format("Y"));
 
-  return ee.List.sequence(startYear, endYear).map(function(y) {
+  return ee.List.sequence(startYear, endYear).map(function (y) {
     y = ee.Number(y);
-    return ee.List.sequence(1, 4).map(function(q) {
+    return ee.List.sequence(1, 4).map(function (q) {
       q = ee.Number(q);
       var w = quarterWindow(y, q);
       var keep = ee.Date(w.get("end")).millis().lte(cutoff.millis());
@@ -92,27 +92,57 @@ function buildQuarterWindows(startYear) {
 // ----------------------
 // HOLE-FILL HELPERS (per-pixel most recent valid label)
 // ----------------------
+//
+// [FIX 1] CRITICAL FIX:
+// We must mask the 't' (timestamp) band with the same mask as 'label'.
+// Otherwise qualityMosaic picks the most recent image's timestamp
+// EVEN IF that image's label is masked at that pixel, leaving the
+// pixel masked in the output instead of falling back to an earlier
+// valid observation.
+//
 function mostRecentLabelBefore(endDate, fillStart) {
   var history = dw.filterDate(fillStart, endDate);
 
-  var withTime = history.map(function(img) {
-    var t = ee.Image.constant(img.date().millis()).rename('t').toInt64();
-    return img.addBands(t);
+  var withTime = history.map(function (img) {
+    var label = img.select('label');
+    // Mask t identically to label so qualityMosaic only "sees" pixels
+    // where a valid label exists.
+    var t = ee.Image.constant(img.date().millis())
+      .rename('t')
+      .toInt64()
+      .updateMask(label.mask());
+    return label.addBands(t);
   });
 
-  // Most recent valid pixel per location
+  // Most recent VALID pixel per location
   return withTime.qualityMosaic('t').select('label');
+}
+
+// Same as above but returns both label and timestamp (for lag stats)
+function mostRecentLabelAndTimeBefore(endDate, fillStart) {
+  var history = dw.filterDate(fillStart, endDate);
+
+  var withTime = history.map(function (img) {
+    var label = img.select('label');
+    var t = ee.Image.constant(img.date().millis())
+      .rename('t')
+      .toInt64()
+      .updateMask(label.mask());
+    return label.addBands(t);
+  });
+
+  return withTime.qualityMosaic('t'); // has 'label' and 't' bands
 }
 
 // Build FILLED quarterly label image (MODE + fill holes)
 function quarterlyFilledLabelImage(w) {
   var start = ee.Date(w.get("start"));
-  var end   = ee.Date(w.get("end"));
+  var end = ee.Date(w.get("end"));
 
   var quarterIC = dw.filterDate(start, end);
   var count = quarterIC.size();
 
-  // MODE for the quarter (may have holes)
+  // MODE for the quarter (may have holes where no pixel had any valid obs)
   var qMode = quarterIC.mode().clip(boundaryGeom);
 
   // Fill window start
@@ -123,7 +153,7 @@ function quarterlyFilledLabelImage(w) {
   );
   fillStart = ee.Date(fillStart);
 
-  // Most recent valid label up to quarter end
+  // Most recent valid label up to quarter end (now correctly masked)
   var recent = mostRecentLabelBefore(end, fillStart).clip(boundaryGeom);
 
   // Fill ONLY masked pixels in qMode
@@ -143,7 +173,7 @@ function quarterlyFilledLabelImage(w) {
 // ----------------------
 function quarterlyFillLagStats(w) {
   var start = ee.Date(w.get("start"));
-  var end   = ee.Date(w.get("end"));
+  var end = ee.Date(w.get("end"));
 
   var quarterIC = dw.filterDate(start, end);
 
@@ -152,42 +182,35 @@ function quarterlyFillLagStats(w) {
 
   // Fill window start
   var fillStart = ee.Algorithms.If(
-      LOOKBACK_MONTHS === null,
-      ee.Date.fromYMD(START_YEAR, 1, 1),
-      start.advance(ee.Number(LOOKBACK_MONTHS).multiply(-1), 'month')
+    LOOKBACK_MONTHS === null,
+    ee.Date.fromYMD(START_YEAR, 1, 1),
+    start.advance(ee.Number(LOOKBACK_MONTHS).multiply(-1), 'month')
   );
   fillStart = ee.Date(fillStart);
 
-  // Build history with timestamp band
-  var history = dw.filterDate(fillStart, end);
-
-  var withTime = history.map(function(img) {
-    var t = ee.Image.constant(img.date().millis())
-        .rename('t')
-        .toInt64();
-    return img.addBands(t);
-  });
-
-  // Most recent valid label + timestamp
-  var recent = withTime.qualityMosaic('t');
+  // Most recent valid label + timestamp (with FIX 1 applied)
+  var recent = mostRecentLabelAndTimeBefore(end, fillStart);
   var recentTime = recent.select('t');
 
-  // Mask where quarterly mode is missing
+  // [FIX 3] Explicit missing-pixel mask:
+  // A pixel is "missing" in qMode if it has no valid mode value.
+  // Use unmask sentinel for unambiguous semantics.
   var missingMask = qMode.mask().not();
 
   // Current quarter end timestamp
   var currentTime = ee.Image.constant(end.millis()).toInt64();
 
-  // Lag in days (only for filled pixels)
+  // [FIX 2] Rename explicitly to avoid relying on auto-named 'constant' band.
   var lagDays = currentTime.subtract(recentTime)
-      .divide(1000 * 60 * 60 * 24)
-      .updateMask(missingMask);
+    .divide(1000 * 60 * 60 * 24)
+    .updateMask(missingMask)
+    .rename('lag_days');
 
   // Reduce over boundary
   var stats = lagDays.reduceRegion({
     reducer: ee.Reducer.mean()
-        .combine({reducer2: ee.Reducer.min(), sharedInputs: true})
-        .combine({reducer2: ee.Reducer.max(), sharedInputs: true}),
+      .combine({ reducer2: ee.Reducer.min(), sharedInputs: true })
+      .combine({ reducer2: ee.Reducer.max(), sharedInputs: true }),
     geometry: boundaryGeom,
     scale: SCALE,
     maxPixels: MAX_PIXELS_PER_REGION
@@ -196,9 +219,9 @@ function quarterlyFillLagStats(w) {
   return ee.Feature(null, {
     year: w.get("year"),
     quarter: w.get("quarter"),
-    mean_lag_days: stats.get("constant_mean"),
-    min_lag_days: stats.get("constant_min"),
-    max_lag_days: stats.get("constant_max")
+    mean_lag_days: stats.get("lag_days_mean"),
+    min_lag_days: stats.get("lag_days_min"),
+    max_lag_days: stats.get("lag_days_max")
   });
 }
 
@@ -223,12 +246,12 @@ function zonalPctFlatForQuarter(labelImg) {
     maxPixelsPerRegion: MAX_PIXELS_PER_REGION
   });
 
-  fc = fc.map(function(f) {
+  fc = fc.map(function (f) {
     var groups = ee.List(ee.Dictionary(f.toDictionary()).get("groups"));
     groups = ee.List(ee.Algorithms.If(groups, groups, ee.List([])));
 
     // Total rasterized area inside polygon
-    var total = ee.Number(groups.iterate(function(g, acc) {
+    var total = ee.Number(groups.iterate(function (g, acc) {
       return ee.Number(acc).add(ee.Number(ee.Dictionary(g).get("sum")));
     }, 0));
 
@@ -250,9 +273,9 @@ function zonalPctFlatForQuarter(labelImg) {
       snow_and_ice: 0
     });
 
-    
+
     // Fill % values for classes present
-    var pctFilled = ee.Dictionary(groups.iterate(function(g, acc) {
+    var pctFilled = ee.Dictionary(groups.iterate(function (g, acc) {
       g = ee.Dictionary(g);
       acc = ee.Dictionary(acc);
 
@@ -282,19 +305,19 @@ function toMillis(d) {
 // ----------------------
 var windows = buildQuarterWindows(START_YEAR);
 
-windows.evaluate(function(winList) {
+windows.evaluate(function (winList) {
   print("Total completed quarters to export:", winList.length);
 
-  winList.forEach(function(wObj) {
+  winList.forEach(function (wObj) {
     var year = wObj.year;
     var q = wObj.quarter;
 
     var startMs = toMillis(wObj.start);
-    var endMs   = toMillis(wObj.end);
+    var endMs = toMillis(wObj.end);
     if (startMs === null || endMs === null) return;
 
     var startEE = ee.Date(startMs);
-    var endEE   = ee.Date(endMs);
+    var endEE = ee.Date(endMs);
 
     // Skip empty quarters (client-side check to avoid pointless tasks)
     var cnt = dw.filterDate(startEE, endEE).size().getInfo();
